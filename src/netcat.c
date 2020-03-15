@@ -26,6 +26,8 @@
 #include "config.h"
 #endif
 
+#include <ouroboros/dev.h>
+
 #include "netcat.h"
 #include <signal.h>
 #include <getopt.h>
@@ -208,6 +210,7 @@ int main(int argc, char *argv[])
 	{ "telnet",	no_argument,		NULL, 't' },
 #endif
 	{ "udp",	no_argument,		NULL, 'u' },
+	{ "ouroboros",	no_argument,		NULL, 'O' },
 	{ "verbose",	no_argument,		NULL, 'v' },
 	{ "version",	no_argument,		NULL, 'V' },
 	{ "hexdump",	no_argument,		NULL, 'x' },
@@ -216,7 +219,7 @@ int main(int argc, char *argv[])
 	{ 0, 0, 0, 0 }
     };
 
-    c = getopt_long(argc, argv, "cde:g:G:hi:lL:no:p:P:rs:S:tTuvVxw:z",
+    c = getopt_long(argc, argv, "cde:g:G:hi:lL:no:p:P:rs:S:tTuOvVxw:z",
 		    long_options, &option_index);
     if (c == -1)
       break;
@@ -328,6 +331,9 @@ int main(int argc, char *argv[])
     case 'u':			/* use UDP protocol */
       opt_proto = NETCAT_PROTO_UDP;
       break;
+    case 'O':			/* use Ouroboros instead of IP */
+      opt_proto = NETCAT_PROTO_OUROBOROS;
+      break;
     case 'v':			/* be verbose (twice=more verbose) */
       opt_verbose++;
       break;
@@ -393,13 +399,17 @@ int main(int argc, char *argv[])
   /* try to get an hostname parameter */
   if (optind < argc) {
     char *myhost = argv[optind++];
-    if (!netcat_resolvehost(&remote_host, myhost))
+    if (opt_proto == NETCAT_PROTO_OUROBOROS)
+      strcpy(remote_host.name, myhost); /* Ouroboros only needs host name */
+    else if (!netcat_resolvehost(&remote_host, myhost))
       ncprint(NCPRINT_ERROR | NCPRINT_EXIT, _("Couldn't resolve host \"%s\""),
 	      myhost);
   }
 
+  debug_dv(("Looking for port ranges."));
+
   /* now loop all the other (maybe optional) parameters for port-ranges */
-  while (optind < argc) {
+  while (opt_proto != NETCAT_PROTO_OUROBOROS && optind < argc) {
     const char *get_argv = argv[optind++];
     char *q, *parse = strdup(get_argv);
     int port_lo = 0, port_hi = 65535;
@@ -527,7 +537,7 @@ int main(int argc, char *argv[])
   netcat_mode = NETCAT_CONNECT;
 
   /* first check that a host parameter was given */
-  if (!remote_host.iaddrs[0].s_addr) {
+  if (opt_proto != NETCAT_PROTO_OUROBOROS && !remote_host.iaddrs[0].s_addr) {
     /* FIXME: The Networking specifications state that host address "0" is a
        valid host to connect to but this broken check will assume as not
        specified. */
@@ -537,9 +547,11 @@ int main(int argc, char *argv[])
 
   /* since ports are the second argument, checking ports might be enough */
   total_ports = netcat_flag_count();
-  if (total_ports == 0)
+  if (opt_proto != NETCAT_PROTO_OUROBOROS && total_ports == 0)
     ncprint(NCPRINT_ERROR | NCPRINT_EXIT,
 	    _("No ports specified for connection"));
+
+  assert(opt_proto == NETCAT_PROTO_OUROBOROS ? total_ports == 0 : total_ports != 0);
 
   c = 0;			/* must be set to 0 for netcat_flag_next() */
   left_ports = total_ports;
@@ -608,6 +620,42 @@ int main(int argc, char *argv[])
 	break;
     }
   }			/* end of while (left_ports > 0) */
+
+  if (opt_proto == NETCAT_PROTO_OUROBOROS) {
+    int fd;
+
+    debug_v(("Connect: START"));
+
+    connect_sock.proto = opt_proto;
+    connect_sock.timeout = opt_wait;
+    memcpy(&connect_sock.host, &remote_host, sizeof(connect_sock.host));
+
+    fd = core_connect(&connect_sock);
+    if (fd < 0)
+      goto main_exit;
+    if (opt_zero) {
+      flow_dealloc(fd);
+      goto main_exit;
+    }
+
+    if (opt_exec) {
+      ncprint(NCPRINT_VERB2, _("Passing control to the specified program"));
+      ncexec(&connect_sock);		/* this won't return */
+    }
+
+    debug_v(("Connect: Starting rw loop"));
+
+    core_readwrite(&connect_sock, &stdio_sock);
+
+    debug_v(("Connect: EXIT"));
+
+    /* both signals are handled inside core_readwrite(), but while the
+       SIGINT signal is fully handled, the SIGTERM requires some action
+       from outside that function, because of this that flag is not
+       cleared. */
+    if (got_sigterm)
+      goto main_exit;
+  }
 
   /* all basic modes should return here for the final cleanup */
  main_exit:

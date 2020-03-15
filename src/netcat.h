@@ -147,7 +147,8 @@ typedef enum {
 typedef enum {
   NETCAT_PROTO_UNSPEC,
   NETCAT_PROTO_TCP,
-  NETCAT_PROTO_UDP
+  NETCAT_PROTO_UDP,
+  NETCAT_PROTO_OUROBOROS
 } nc_proto_t;
 
 /* used for queues buffering and data tracking purposes.  The `head' field is
@@ -168,7 +169,7 @@ typedef struct {
    notation and in the dotted string notation. */
 
 typedef struct {
-  char name[MAXHOSTNAMELEN];			/* dns name */
+  char name[MAXHOSTNAMELEN];			/* dns name / Ouroboros name */
   char addrs[MAXINETADDRS][NETCAT_ADDRSTRLEN];	/* ascii-format IP addresses */
   struct in_addr iaddrs[MAXINETADDRS];		/* real addresses */
 } nc_host_t;

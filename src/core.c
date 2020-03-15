@@ -26,12 +26,50 @@
 #include "config.h"
 #endif
 
+#include <ouroboros/dev.h>
+#include <ouroboros/fqueue.h>
+
 #include "netcat.h"
+#include "misc.h"
 
 /* Global variables */
 
 unsigned long bytes_sent = 0;		/* total bytes received */
 unsigned long bytes_recv = 0;		/* total bytes sent */
+
+#define TIMEVAL_DIFF(__t1, __t2) {			\
+    (__t1)->tv_usec -= (__t2)->tv_usec;			\
+    if ((__t1)->tv_usec < 0) {				\
+      (__t1)->tv_usec += 1000000L;			\
+      (__t1)->tv_sec -= 1;				\
+    }							\
+    (__t1)->tv_sec -= (__t2)->tv_sec;			\
+    if ((__t1)->tv_sec < 0) {				\
+      (__t1)->tv_sec = 0;				\
+      (__t1)->tv_usec = 0;				\
+    }							\
+  }
+
+#ifndef USE_LINUX_SELECT
+void update_timeval(struct timeval *target)
+{
+  static struct timeval dd_start;
+  struct timeval dd_end;
+  struct timezone dd_zone;
+
+  if (target == NULL) {			/* just initialize the seed */
+    if (gettimeofday(&dd_start, &dd_zone))
+      return;				/* can't handle this type of error */
+  }
+  else {
+    if (gettimeofday(&dd_end, &dd_zone))
+      return;				/* can't handle this type of error */
+
+    TIMEVAL_DIFF(&dd_end, &dd_start);	/* get the spent time */
+    TIMEVAL_DIFF(target, &dd_end);	/* and update the target struct */
+  }
+}
+#endif
 
 /* Creates a UDP socket with a default destination address.  It also calls
    bind(2) if it is needed in order to specify the source address.
@@ -365,7 +403,6 @@ static int core_tcp_connect(nc_sock_t *ncsock)
     debug_v(("Connection returned errcode=%d (%s)", get_ret, strerror(get_ret)));
     if (get_ret > 0) {
       char tmp;
-
       /* Ok, select() returned a write event for this socket AND getsockopt()
          said that some error happened.  This mean that EOF is expected. */
       ret = read(sock, &tmp, 1);
@@ -487,7 +524,77 @@ static int core_tcp_listen(nc_sock_t *ncsock)
   return sock_accept;
 }				/* end of core_tcp_listen() */
 
-/* ... */
+/* Ouroboros support */
+
+int core_ouroboros_connect(nc_sock_t *ncsock)
+{
+  int fd; /* flow descriptor */
+  struct timespec t;
+  struct timespec *timeo = NULL;
+
+  assert(ncsock);
+
+  debug_v(("core_ouroboros_connect(ncsock=%p)", (void *)ncsock));
+
+  if (ncsock->timeout > 0) {
+    t.tv_sec = ncsock->timeout;
+    t.tv_nsec = 0;
+    timeo = &t;
+  }
+
+  fd = flow_alloc(ncsock->host.name, NULL, timeo);
+  if (fd < 0) {
+      if (fd == -ETIMEDOUT)
+        ncprint(NCPRINT_ERROR | NCPRINT_EXIT,
+		"Failed to allocate flow (timed out)");
+      else
+        ncprint(NCPRINT_ERROR | NCPRINT_EXIT,
+		"Failed to allocate flow (err=%d)", fd);
+  }
+
+  /* everything went fine, we have the flow */
+  ncprint(NCPRINT_VERB1, "Flow to %s allocated (fd=%d)",
+	  ncsock->host.name, fd);
+
+  return fd;
+}
+
+int core_ouroboros_listen(nc_sock_t *ncsock)
+{
+  int fd; /* flow descriptor */
+  struct timespec t;
+  struct timespec *timeo = NULL;
+
+  assert(ncsock); /* only interesting thing in there is timeout */
+
+  debug_v(("core_ouroboros_listen(ncsock=%p)", (void *)ncsock));
+
+  if (ncsock->timeout > 0) {
+    t.tv_sec = ncsock->timeout;
+    t.tv_nsec = 0;
+    timeo = &t;
+  }
+
+  while (TRUE) {
+    fd = flow_accept(NULL, timeo);
+    if (fd < 0) {
+      if (fd == -ETIMEDOUT)
+        ncprint(NCPRINT_ERROR | NCPRINT_EXIT,
+		"Failed to accept flow (timed out)");
+      else
+        ncprint(NCPRINT_ERROR | NCPRINT_EXIT,
+		"Failed to accept flow (err=%d)", fd);
+    }
+    if (opt_zero) /* opt_zero doesn't really accept flows */
+      flow_dealloc(fd);
+    else
+      break;
+  }
+
+  ncprint(NCPRINT_VERB2, "Flow received (new fd=%d)", fd);
+
+  return fd;
+}
 
 int core_connect(nc_sock_t *ncsock)
 {
@@ -497,6 +604,8 @@ int core_connect(nc_sock_t *ncsock)
     return ncsock->fd = core_tcp_connect(ncsock);
   else if (ncsock->proto == NETCAT_PROTO_UDP)
     return ncsock->fd = core_udp_connect(ncsock);
+  else if (ncsock->proto == NETCAT_PROTO_OUROBOROS)
+    return ncsock->fd = core_ouroboros_connect(ncsock);
   else
     abort();
 
@@ -513,22 +622,26 @@ int core_listen(nc_sock_t *ncsock)
     return ncsock->fd = core_tcp_listen(ncsock);
   else if (ncsock->proto == NETCAT_PROTO_UDP)
     return ncsock->fd = core_udp_listen(ncsock);
+  else if (ncsock->proto == NETCAT_PROTO_OUROBOROS)
+    return ncsock->fd = core_ouroboros_listen(ncsock);
   else
     abort();
 
   return -1;
 }
 
-/* handle stdin/stdout/network I/O. */
-
 int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
 {
   int fd_stdin, fd_stdout, fd_sock, fd_max;
+  int fd_o = -1;
   int read_ret, write_ret;
   unsigned char buf[1024];
   bool inloop = TRUE;
   fd_set ins, outs;
+  fset_t * set;
+  fqueue_t * fq;
   struct timeval delayer;
+
   assert(nc_main && nc_slave);
 
   debug_v(("core_readwrite(nc_main=%p, nc_slave=%p)", (void *)nc_main,
@@ -537,6 +650,18 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
   /* set the actual input and output fds and find out the max fd + 1 */
   fd_sock = nc_main->fd;
   assert(fd_sock >= 0);
+
+  if (opt_proto == NETCAT_PROTO_OUROBOROS) {
+    set = fset_create();
+    if (set == NULL)
+      return -1;
+    fq = fqueue_create();
+    if (fq == NULL) {
+      fset_destroy(set);
+      return -1;
+    }
+    fset_add(set, fd_sock);
+  }
 
   /* if the domain is unspecified, it means that this is the standard I/O */
   if (nc_slave->domain == PF_UNSPEC) {
@@ -547,6 +672,7 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
     fd_stdin = fd_stdout = nc_slave->fd;
     assert(fd_stdin >= 0);
   }
+
   fd_max = 1 + (fd_stdin > fd_sock ? fd_stdin : fd_sock);
   delayer.tv_sec = 0;
   delayer.tv_usec = 0;
@@ -577,7 +703,8 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
        and so requires some more time to free up. */
     if (nc_main->recvq.len == 0) {
       debug_v(("watching main sock for incoming data (recvq is empty)"));
-      FD_SET(fd_sock, &ins);
+      if (opt_proto != NETCAT_PROTO_OUROBOROS)
+        FD_SET(fd_sock, &ins);
     }
     else
       call_select = FALSE;
@@ -601,13 +728,16 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
     if (nc_main->sendq.len > 0) {
       if ((delayer.tv_sec == 0) && (delayer.tv_usec == 0)) {
 	debug_v(("watching main sock for outgoing availability (there is pending data)"));
-	FD_SET(fd_sock, &outs);
+	if (opt_proto != NETCAT_PROTO_OUROBOROS)
+          FD_SET(fd_sock, &outs);
 	call_select = TRUE;
       }
     }
 
     if (call_select || delayer.tv_sec || delayer.tv_usec) {
       int ret;
+      ssize_t event_ret;
+
 #ifndef USE_LINUX_SELECT
       struct timeval dd_saved;
 
@@ -617,8 +747,36 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
 #endif
 
       debug(("[select] entering with timeout=%d:%d ...", delayer.tv_sec, delayer.tv_usec));
-      ret = select(fd_max, &ins, &outs, NULL,
-		   (delayer.tv_sec || delayer.tv_usec ? &delayer : NULL));
+      while (TRUE) {
+        struct timeval  intvv = {0, 100};        /* 100 us */
+
+        TIMEVAL_DIFF(&delayer, &intvv);
+
+        ret = select(fd_max, &ins, &outs, NULL, &intvv);
+
+        if (opt_proto == NETCAT_PROTO_OUROBOROS) {
+          struct timespec intvs = {0, 100 * 1000}; /* 100 us */
+          fd_o = -1;
+
+          if (ret > 0) /* in is ready, just poll */
+            intvs.tv_nsec = 0;
+          else
+            TIMEVAL_DIFF(&delayer, &intvv);
+
+          event_ret = fevent(set, fq, &intvs);
+          while (event_ret-- > 0) {
+            fd_o = fqueue_next(fq);
+            if (fqueue_type(fq) == FLOW_PKT)
+              break;
+          }
+        }
+
+        if (ret > 0 || fd_o > 0)
+          break;
+
+        if (delayer.tv_sec <= 0 && delayer.tv_usec == 0)
+          break;
+      }
 
 #ifndef USE_LINUX_SELECT
       delayer.tv_sec = dd_saved.tv_sec;
@@ -729,7 +887,11 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
 	delayer.tv_sec = opt_interval;
       }
 
-      write_ret = write(fd_sock, data, data_len);
+      if (opt_proto == NETCAT_PROTO_OUROBOROS) {
+        write_ret = flow_write(fd_sock, data, data_len);
+        debug_dv(("flow_write %d returned: %zd.", fd_sock, write_ret));
+      } else
+        write_ret = write(fd_sock, data, data_len);
       if (write_ret < 0) {
 	if (errno == EAGAIN)
 	  write_ret = 0;	/* write would block, append it to select */
@@ -781,7 +943,7 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
     }				/* end of reading from stdin section */
 
     /* reading from the socket (net). */
-    if (call_select && FD_ISSET(fd_sock, &ins)) {
+    if (call_select && (FD_ISSET(fd_sock, &ins) || fd_o != -1)) {
       if ((nc_main->proto == NETCAT_PROTO_UDP) && opt_zero) {
 	memset(&recv_addr, 0, sizeof(recv_addr));
 	/* this allows us to fetch packets from different addresses */
@@ -793,7 +955,10 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
       }
       else {
 	/* common file read fallback */
-	read_ret = read(fd_sock, buf, sizeof(buf));
+        if(fd_o != -1)
+          read_ret = flow_read(fd_o, buf, sizeof(buf));
+        else
+          read_ret = read(fd_sock, buf, sizeof(buf));
 	debug_dv(("read(net) = %d", read_ret));
       }
 
@@ -899,8 +1064,13 @@ int core_readwrite(nc_sock_t *nc_main, nc_sock_t *nc_slave)
   }				/* end of while (inloop) */
 
   /* we've got an EOF from the net, close the sockets */
-  shutdown(fd_sock, SHUT_RDWR);
-  close(fd_sock);
+  if (opt_proto == NETCAT_PROTO_OUROBOROS) {
+    fqueue_destroy(fq);
+    fset_destroy(set);
+  } else {
+    shutdown(fd_sock, SHUT_RDWR);
+    close(fd_sock);
+  }
   nc_main->fd = -1;
 
   /* close the slave socket only if it wasn't a simulation */

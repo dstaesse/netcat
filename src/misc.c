@@ -303,15 +303,18 @@ void netcat_commandline_read(int *argc, char ***argv)
 
 void netcat_printhelp(char *argv0)
 {
-  printf(_("GNU netcat %s, a rewrite of the famous networking tool.\n"), VERSION);
+  printf(_("GNU netcat %s, a rewrite of the famous networking tool with Ouroboros support!\n"), VERSION);
   printf(_("Basic usages:\n"));
-  printf(_("connect to somewhere:  %s [options] hostname port [port] ...\n"), argv0);
+  printf(_("connect to somewhere:  %s [options] hostname [port] [port] ...\n"), argv0);
   printf(_("listen for inbound:    %s -l -p port [options] [hostname] [port] ...\n"), argv0);
   printf(_("tunnel to somewhere:   %s -L hostname:port -p port [options]\n"), argv0);
   printf("\n");
   printf(_("Mandatory arguments to long options are mandatory for short options too.\n"));
   printf(_("Options:\n"
 "  -c, --close                close connection on EOF from stdin\n"
+#ifdef DEBUG
+"  -d, --debug                print debug output\n"
+#endif
 "  -e, --exec=PROGRAM         program to exec after connect\n"
 "  -g, --gateway=LIST         source-routing hop point[s], up to 8\n"
 "  -G, --pointer=NUM          source-routing pointer: 4, 8, 12, ...\n"
@@ -337,6 +340,7 @@ void netcat_printhelp(char *argv0)
 #endif
   printf(_(""
 "  -u, --udp                  UDP mode\n"
+"  -O, --ouroboros            Ouroboros mode\n"
 "  -v, --verbose              verbose (use twice to be more verbose)\n"
 "  -V, --version              output version information and exit\n"
 "  -x, --hexdump              hexdump incoming and outgoing traffic\n"
@@ -383,39 +387,5 @@ const char *debug_fmt(const char *fmt, ...)
   }
 
   return buf;
-}
-#endif
-
-#ifndef USE_LINUX_SELECT
-#define TIMEVAL_DIFF(__t1, __t2) {			\
-    (__t1)->tv_usec -= (__t2)->tv_usec;			\
-    if ((__t1)->tv_usec < 0) {				\
-      (__t1)->tv_usec += 1000000L;			\
-      (__t1)->tv_sec -= 1;				\
-    }							\
-    (__t1)->tv_sec -= (__t2)->tv_sec;			\
-    if ((__t1)->tv_sec < 0) {				\
-      (__t1)->tv_sec = 0;				\
-      (__t1)->tv_usec = 0;				\
-    }							\
-  }
-
-void update_timeval(struct timeval *target)
-{
-  static struct timeval dd_start;
-  struct timeval dd_end;
-  struct timezone dd_zone;
-
-  if (target == NULL) {			/* just initialize the seed */
-    if (gettimeofday(&dd_start, &dd_zone))
-      return;				/* can't handle this type of error */
-  }
-  else {
-    if (gettimeofday(&dd_end, &dd_zone))
-      return;				/* can't handle this type of error */
-
-    TIMEVAL_DIFF(&dd_end, &dd_start);	/* get the spent time */
-    TIMEVAL_DIFF(target, &dd_end);	/* and update the target struct */
-  }
 }
 #endif
